@@ -153,17 +153,20 @@ def find_root_task() -> asyncio.Task:
             return root_task
 
     # Look up the topmost task in the AnyIO task tree, if possible
-    task = cast(asyncio.Task, current_task())
-    state = _task_states.get(task)
-    if state:
-        cancel_scope = state.cancel_scope
-        while cancel_scope and cancel_scope._parent_scope is not None:
-            cancel_scope = cancel_scope._parent_scope
+    cur_task = current_task()
+    if cur_task is not None:
+        state = _task_states.get(cur_task)
+        if state:
+            cancel_scope = state.cancel_scope
+            while cancel_scope and cancel_scope._parent_scope is not None:
+                cancel_scope = cancel_scope._parent_scope
 
-        if cancel_scope is not None:
-            return cast(asyncio.Task, cancel_scope._host_task)
+            if cancel_scope is not None and cancel_scope._host_task is not None:
+                return cancel_scope._host_task
+    else:
+        raise RuntimeError("No root task")
 
-    return task
+    return cur_task
 
 
 def get_callable_name(func: Callable) -> str:
@@ -218,16 +221,18 @@ def run(func: Callable[..., Awaitable[T_Retval]], *args: object,
         policy: Optional[asyncio.AbstractEventLoopPolicy] = None) -> T_Retval:
     @wraps(func)
     async def wrapper() -> T_Retval:
-        task = cast(asyncio.Task, current_task())
-        task_state = TaskState(None, get_callable_name(func), None)
-        _task_states[task] = task_state
-        if _native_task_names:
-            task.set_name(task_state.name)
+        task = current_task()
+        if task is not None:
+            task_state = TaskState(None, get_callable_name(func), None)
+            _task_states[task] = task_state
+            if task is not None and _native_task_names:
+                task.set_name(task_state.name)
 
         try:
             return await func(*args)
         finally:
-            del _task_states[task]
+            if task is not None:
+                del _task_states[task]
 
     _maybe_set_event_loop_policy(policy, use_uvloop)
     return native_run(wrapper(), debug=debug)
@@ -269,7 +274,9 @@ class CancelScope(BaseCancelScope):
                 "Each CancelScope may only be used for a single 'with' block"
             )
 
-        self._host_task = host_task = cast(asyncio.Task, current_task())
+        self._host_task = host_task = current_task()
+        if host_task is None:
+            raise RuntimeError('No current task')
         self._tasks.add(host_task)
         try:
             task_state = _task_states[host_task]
@@ -596,7 +603,7 @@ class TaskGroup(abc.TaskGroup):
         # This is the code path for Python 3.6 and 3.7 on which asyncio freaks out if a task raises
         # a BaseException.
         __traceback_hide__ = __tracebackhide__ = True  # noqa: F841
-        task = cast(asyncio.Task, current_task())
+        task = current_task()
         try:
             await coro
         except BaseException as exc:
